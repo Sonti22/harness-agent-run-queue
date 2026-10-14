@@ -54,28 +54,43 @@ function identifier(value: string, name: string): void {
   }
 }
 
-// Do not silently change a request by dropping undefined, converting NaN to null,
-// or invoking toJSON(). JSONB equality then defines idempotency payload equality.
+// Read data descriptors once and encode only their validated values. Never call
+// a getter or stringify the original objects (which could invoke toJSON()).
+// JSONB equality then defines idempotency payload equality.
 function encodeJson(value: Json): string {
   const ancestors = new Set<object>();
-  function visit(item: unknown): void {
-    if (item === null || typeof item === 'string' || typeof item === 'boolean') return;
-    if (typeof item === 'number' && Number.isFinite(item)) return;
+  function serialize(item: unknown): string {
+    if (item === null || typeof item === 'string' || typeof item === 'boolean') return JSON.stringify(item);
+    if (typeof item === 'number' && Number.isFinite(item)) return JSON.stringify(item);
     if (typeof item !== 'object') throw new TypeError('Expected a JSON value');
     if (ancestors.has(item)) throw new TypeError('Cyclic JSON value');
-    if (!Array.isArray(item) && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) {
+    const isArray = Array.isArray(item);
+    const prototype = Object.getPrototypeOf(item);
+    if (!isArray && prototype !== Object.prototype && prototype !== null) {
       throw new TypeError('Expected a plain JSON object');
     }
-    ancestors.add(item);
-    if (Array.isArray(item)) {
-      for (let i = 0; i < item.length; i++) visit(item[i]);
-    } else {
-      for (const child of Object.values(item)) visit(child);
+    const properties = Object.getOwnPropertyDescriptors(item);
+    for (const [key, descriptor] of Object.entries(properties)) {
+      if ('get' in descriptor || 'set' in descriptor) throw new TypeError('JSON properties must contain data, not accessors');
+      if (key === 'toJSON' && typeof descriptor.value === 'function') throw new TypeError('Custom toJSON is not supported');
     }
-    ancestors.delete(item);
+    ancestors.add(item);
+    try {
+      if (isArray) {
+        const elements: string[] = [];
+        const length = properties.length!.value as number;
+        for (let i = 0; i < length; i++) elements.push(serialize(properties[String(i)]?.value));
+        return `[${elements.join(',')}]`;
+      }
+      const fields = Object.entries(properties)
+        .filter(([, descriptor]) => descriptor.enumerable)
+        .map(([key, descriptor]) => `${JSON.stringify(key)}:${serialize(descriptor.value)}`);
+      return `{${fields.join(',')}}`;
+    } finally {
+      ancestors.delete(item);
+    }
   }
-  visit(value);
-  return JSON.stringify(value);
+  return serialize(value);
 }
 
 export class RunQueue {

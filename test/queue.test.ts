@@ -93,6 +93,65 @@ test('invalid JSON and identifiers do not enqueue altered requests', async () =>
   assert.equal((await pool.query('SELECT count(*) FROM runs')).rows[0].count, '0');
 });
 
+test('enqueue rejects object and array accessors without calling them or inserting a run', async () => {
+  let reads = 0;
+  const getter = () => { reads++; return reads === 1 ? 42 : undefined; };
+  const object = Object.defineProperty({}, 'value', { enumerable: true, get: getter });
+  const array = Object.defineProperty([1], '0', { enumerable: true, get: getter });
+  const setterOnly = Object.defineProperty({}, 'value', { enumerable: true, set: () => { throw new Error('setter executed'); } });
+  for (const payload of [object, array, { nested: object }, setterOnly]) {
+    await assert.rejects(queue.enqueue('accessor-dialog', 'key', payload as Json), TypeError);
+  }
+  assert.equal(reads, 0, 'validation must not execute any getter');
+  assert.equal((await pool.query('SELECT count(*) FROM runs')).rows[0].count, '0');
+  assert.equal((await pool.query('SELECT count(*) FROM dialogs')).rows[0].count, '0');
+});
+
+test('enqueue rejects custom toJSON without calling it or storing substituted content', async () => {
+  let calls = 0;
+  const hook = () => { calls++; return { replaced: true, invalidNumber: NaN }; };
+  const array = Object.defineProperty([1, 2], 'toJSON', { value: hook });
+  const object = Object.defineProperty({ original: true }, 'toJSON', { value: hook });
+  for (const payload of [array, object, { nested: array }]) {
+    await assert.rejects(queue.enqueue('hook-dialog', 'key', payload as Json), TypeError);
+  }
+  assert.equal(calls, 0, 'serialization must not execute toJSON');
+  assert.equal((await pool.query('SELECT count(*) FROM runs')).rows[0].count, '0');
+});
+
+test('complete rejects accessors and toJSON results and preserves the current running attempt', async () => {
+  await queue.enqueue('result-dialog', 'key', {});
+  const run = await take();
+  let calls = 0;
+  const accessor = Object.defineProperty({}, 'answer', { enumerable: true, get: () => { calls++; return 'changed'; } });
+  const hook = Object.defineProperty(['original'], 'toJSON', { value: () => { calls++; return ['changed']; } });
+  for (const result of [accessor, hook]) {
+    await assert.rejects(queue.complete(run.id, owner(run), result as Json), TypeError);
+  }
+  assert.equal(calls, 0);
+  const stored = (await pool.query('SELECT status, result, lease_token, attempts FROM runs WHERE id = $1', [run.id])).rows[0];
+  assert.equal(stored.status, 'running');
+  assert.equal(stored.result, null);
+  assert.equal(stored.lease_token, run.lease_token);
+  assert.equal(stored.attempts, 1);
+  await queue.complete(run.id, owner(run), { answer: 'valid' });
+});
+
+test('plain JSON round-trips including shared references, null-prototype objects and toJSON data keys', async () => {
+  const shared = { text: 'Привет', values: [null, false, 0, ''] };
+  const payload = Object.assign(Object.create(null), {
+    left: shared, right: shared, toJSON: 'ordinary data',
+    nested: JSON.parse('{"__proto__":{"value":1},"quote":"a\\\"b"}'),
+  });
+  const expected = JSON.parse(JSON.stringify(payload));
+  const first = await queue.enqueue('plain-dialog', 'key', payload);
+  assert.deepEqual(first.payload, expected);
+  const duplicate = await queue.enqueue('plain-dialog', 'key', expected);
+  assert.equal(duplicate.id, first.id);
+  const run = await take();
+  assert.deepEqual((await queue.complete(run.id, owner(run), payload)).result, expected);
+});
+
 test('three simultaneous claimers cannot take the same run', async () => {
   await queue.enqueue('dialog', 'key', {});
   const runs = await Promise.all(['w1', 'w2', 'w3'].map((worker) => queue.claim(worker)));
