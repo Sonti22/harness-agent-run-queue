@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:16.4
+    environment:
+      POSTGRES_DB: harness_queue_test
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: harness_local_only
+    ports:
+      - "127.0.0.1:18765:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness -d harness_queue_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    volumes:
+      - queue_data:/var/lib/postgresql/data
+volumes:
+  queue_data:

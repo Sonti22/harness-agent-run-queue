@@ -1,0 +1,36 @@
+name: PostgreSQL integration tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    services:
+      postgres:
+        image: postgres:16.4
+        env:
+          POSTGRES_DB: harness_queue_test
+          POSTGRES_USER: harness
+          POSTGRES_PASSWORD: harness_ci_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U harness -d harness_queue_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://harness:harness_ci_only@127.0.0.1:5432/harness_queue_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run db:migrate
+      - run: npm run db:migrate
+      - run: npm test
